@@ -1,0 +1,9 @@
+# Local Environment Variables
+.env*.local
+
+# Next.js
+.next/
+out/
+
+# Dependencies
+node_modules/

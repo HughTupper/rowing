@@ -6,6 +6,8 @@ Rowing is a rowing application with which helps users track their rowing activit
 
 ## Tech Stack
 
+Always check for latest versions before adding new dependencies.
+
 ### Core Framework
 
 - **Next.js 16.1.1** with App Router and React 19
