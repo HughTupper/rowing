@@ -1,17 +1,23 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ConnectionStatus, RowingMetrics } from "@/lib/rowing";
+import {
+  ConnectionStatus,
+  RowingMetrics,
+  SimSpeed,
+  Split500m,
+  SplitAccumulator,
+  checkSplitBoundary,
+  freshAccumulator,
+} from "@/lib/rowing";
 import { RowingMachineState } from "@/hooks/useRowingMachine";
 
 const HISTORY_MAX = 60;
 const TICK_MS = 1000;
 
-// Simulate a realistic moderate-effort 20-minute rowing session.
-// Values are based on observed ERG780 data at resistance level 3.
-
-function noise(amplitude: number): number {
-  return (Math.random() - 0.5) * 2 * amplitude;
+export interface SimulatedRowingMachineState extends RowingMachineState {
+  simSpeed: SimSpeed;
+  setSimSpeed: (speed: SimSpeed) => void;
 }
 
 interface SimState {
@@ -22,40 +28,42 @@ interface SimState {
   totalEnergy: number;
 }
 
+function noise(amplitude: number): number {
+  return (Math.random() - 0.5) * 2 * amplitude;
+}
+
 function computeTick(sim: SimState): { metrics: RowingMetrics; next: SimState } {
   const t = sim.tick;
 
-  // Stroke rate: 20–26 SPM, oscillates on a slow sine wave
-  const strokeRate = Math.round(23 + Math.sin(t / 15) * 3 + noise(0.5));
-  const clampedRate = Math.max(18, Math.min(28, strokeRate));
+  const strokeRate = Math.max(
+    18,
+    Math.min(28, Math.round(23 + Math.sin(t / 15) * 3 + noise(0.5)))
+  );
 
-  // Accumulate fractional strokes (rate is strokes/min → per second = rate/60)
-  const strokeAccumulator = sim.strokeAccumulator + clampedRate / 60;
+  const strokeAccumulator = sim.strokeAccumulator + strokeRate / 60;
   const strokeCount = sim.strokeCount + Math.floor(strokeAccumulator);
   const remainingAccumulator = strokeAccumulator % 1;
 
-  // Pace in s/500m: varies 150–210 (2:30–3:30/500m)
-  const instantPace = Math.round(180 + Math.sin(t / 20) * 25 + noise(3));
-  const clampedPace = Math.max(130, Math.min(240, instantPace));
+  const instantPace = Math.max(
+    130,
+    Math.min(240, Math.round(180 + Math.sin(t / 20) * 25 + noise(3)))
+  );
 
-  // Power from pace: roughly power ∝ 2.8e9 / pace³ (empirical rowing formula)
-  const instantPower = Math.round(2.8e9 / Math.pow(clampedPace, 3) + noise(4));
-  const clampedPower = Math.max(30, Math.min(250, instantPower));
+  const instantPower = Math.max(
+    30,
+    Math.min(250, Math.round(2.8e9 / Math.pow(instantPace, 3) + noise(4)))
+  );
 
-  // Distance: each stroke covers ~ (500 / pace) * (60 / strokeRate) metres
-  // Simpler: distance from pace — 500m takes `clampedPace` seconds
-  const distancePerSecond = 500 / clampedPace;
+  const distancePerSecond = 500 / instantPace;
   const totalDistance = Math.round(sim.totalDistance + distancePerSecond);
-
-  // Energy: ~1 kcal per 12 seconds at moderate effort
   const totalEnergy = Math.floor(t / 12);
 
   const metrics: RowingMetrics = {
-    strokeRate: clampedRate,
+    strokeRate,
     strokeCount,
     totalDistance,
-    instantPace: clampedPace,
-    instantPower: clampedPower,
+    instantPace,
+    instantPower,
     resistanceLevel: 3,
     totalEnergy,
     elapsedTime: t,
@@ -73,12 +81,15 @@ function computeTick(sim: SimState): { metrics: RowingMetrics; next: SimState } 
   };
 }
 
-export function useSimulatedRowingMachine(): RowingMachineState {
+export function useSimulatedRowingMachine(): SimulatedRowingMachineState {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [metrics, setMetrics] = useState<RowingMetrics>({});
   const [history, setHistory] = useState<RowingMetrics[]>([]);
+  const [splits, setSplits] = useState<Split500m[]>([]);
+  const [simSpeed, setSimSpeedState] = useState<SimSpeed>(1);
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const simSpeedRef = useRef<SimSpeed>(1);
   const simStateRef = useRef<SimState>({
     tick: 0,
     strokeAccumulator: 0,
@@ -86,6 +97,10 @@ export function useSimulatedRowingMachine(): RowingMachineState {
     totalDistance: 0,
     totalEnergy: 0,
   });
+  const splitAccRef = useRef<SplitAccumulator>(freshAccumulator(1));
+  // Stable ref for setSplits to use inside the interval without re-creating it
+  const setSplitsRef = useRef(setSplits);
+  setSplitsRef.current = setSplits;
 
   const stopInterval = () => {
     if (intervalRef.current !== null) {
@@ -94,10 +109,16 @@ export function useSimulatedRowingMachine(): RowingMachineState {
     }
   };
 
+  const setSimSpeed = useCallback((speed: SimSpeed) => {
+    simSpeedRef.current = speed;
+    setSimSpeedState(speed);
+  }, []);
+
   const connect = useCallback(async () => {
     setStatus("connecting");
     setMetrics({});
     setHistory([]);
+    setSplits([]);
     simStateRef.current = {
       tick: 0,
       strokeAccumulator: 0,
@@ -105,18 +126,45 @@ export function useSimulatedRowingMachine(): RowingMachineState {
       totalDistance: 0,
       totalEnergy: 0,
     };
+    splitAccRef.current = freshAccumulator(1);
 
-    // Simulate a 1.5s connection delay
     await new Promise((r) => setTimeout(r, 1500));
 
     setStatus("connected");
 
     intervalRef.current = setInterval(() => {
-      const { metrics: next, next: nextSim } = computeTick(simStateRef.current);
-      simStateRef.current = nextSim;
-      setMetrics(next);
+      const speed = simSpeedRef.current;
+      let currentSim = simStateRef.current;
+      let lastMetrics: RowingMetrics = {};
+      const newSplits: Split500m[] = [];
+
+      // Process N ticks per interval fire based on speed multiplier
+      for (let i = 0; i < speed; i++) {
+        const { metrics: tickMetrics, next: nextSim } = computeTick(currentSim);
+        currentSim = nextSim;
+        lastMetrics = tickMetrics;
+
+        // Check split boundary on every sub-tick to handle fast speeds correctly
+        const completed = checkSplitBoundary(tickMetrics, splitAccRef.current);
+        if (completed) {
+          newSplits.push(completed);
+          splitAccRef.current = {
+            ...freshAccumulator(completed.splitNumber + 1),
+            startElapsedTime: tickMetrics.elapsedTime ?? 0,
+            startStrokeCount: tickMetrics.strokeCount ?? 0,
+          };
+        }
+      }
+
+      simStateRef.current = currentSim;
+
+      if (newSplits.length > 0) {
+        setSplitsRef.current((prev) => [...prev, ...newSplits]);
+      }
+
+      setMetrics(lastMetrics);
       setHistory((h) => {
-        const updated = [...h, next];
+        const updated = [...h, lastMetrics];
         return updated.length > HISTORY_MAX
           ? updated.slice(updated.length - HISTORY_MAX)
           : updated;
@@ -128,10 +176,11 @@ export function useSimulatedRowingMachine(): RowingMachineState {
     stopInterval();
     setMetrics({});
     setHistory([]);
+    setSplits([]);
+    splitAccRef.current = freshAccumulator(1);
     setStatus("idle");
   }, []);
 
-  // Clean up on unmount
   useEffect(() => stopInterval, []);
 
   return {
@@ -139,7 +188,10 @@ export function useSimulatedRowingMachine(): RowingMachineState {
     deviceName: "ERG780 (Sim)",
     metrics,
     history,
+    splits,
     connect,
     disconnect,
+    simSpeed,
+    setSimSpeed,
   };
 }

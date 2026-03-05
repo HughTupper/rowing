@@ -10,6 +10,7 @@ export default function SimPage() {
       state={state}
       ctaLabel="Start Simulation"
       description="Preview the rowing session UI with simulated live data — no rower required."
+      simControls={{ speed: state.simSpeed, setSpeed: state.setSimSpeed }}
     />
   );
 }

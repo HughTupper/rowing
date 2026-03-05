@@ -6,6 +6,10 @@ import {
   FTMS_SERVICE,
   ROWER_DATA_UUID,
   RowingMetrics,
+  Split500m,
+  SplitAccumulator,
+  checkSplitBoundary,
+  freshAccumulator,
   parseFTMSRowerData,
 } from "@/lib/rowing";
 
@@ -16,6 +20,7 @@ export interface RowingMachineState {
   deviceName: string | null;
   metrics: RowingMetrics;
   history: RowingMetrics[];
+  splits: Split500m[];
   connect: () => Promise<void>;
   disconnect: () => void;
 }
@@ -25,8 +30,10 @@ export function useRowingMachine(): RowingMachineState {
   const [deviceName, setDeviceName] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<RowingMetrics>({});
   const [history, setHistory] = useState<RowingMetrics[]>([]);
+  const [splits, setSplits] = useState<Split500m[]>([]);
 
   const serverRef = useRef<BluetoothRemoteGATTServer | null>(null);
+  const splitAccRef = useRef<SplitAccumulator>(freshAccumulator(1));
 
   const handleCharacteristicChange = useCallback((event: Event) => {
     const target = event.target as BluetoothRemoteGATTCharacteristic;
@@ -37,6 +44,18 @@ export function useRowingMachine(): RowingMachineState {
       const parsed = parseFTMSRowerData(value);
       setMetrics((prev) => {
         const next = { ...prev, ...parsed };
+
+        // Split tracking
+        const completed = checkSplitBoundary(next, splitAccRef.current);
+        if (completed) {
+          setSplits((s) => [...s, completed]);
+          splitAccRef.current = {
+            ...freshAccumulator(completed.splitNumber + 1),
+            startElapsedTime: next.elapsedTime ?? 0,
+            startStrokeCount: next.strokeCount ?? 0,
+          };
+        }
+
         setHistory((h) => {
           const updated = [...h, next];
           return updated.length > HISTORY_MAX
@@ -57,6 +76,8 @@ export function useRowingMachine(): RowingMachineState {
     setStatus("connecting");
     setMetrics({});
     setHistory([]);
+    setSplits([]);
+    splitAccRef.current = freshAccumulator(1);
 
     try {
       const device = await navigator.bluetooth.requestDevice({
@@ -128,8 +149,10 @@ export function useRowingMachine(): RowingMachineState {
     setDeviceName(null);
     setMetrics({});
     setHistory([]);
+    setSplits([]);
+    splitAccRef.current = freshAccumulator(1);
     setStatus("idle");
   }, []);
 
-  return { status, deviceName, metrics, history, connect, disconnect };
+  return { status, deviceName, metrics, history, splits, connect, disconnect };
 }

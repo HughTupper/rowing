@@ -7,6 +7,8 @@ export type ConnectionStatus =
   | "disconnected"
   | "error";
 
+export type SimSpeed = 1 | 5 | 10 | 50;
+
 export interface RowingMetrics {
   strokeRate?: number;
   strokeCount?: number;
@@ -22,6 +24,143 @@ export interface RowingMetrics {
   metabolicEquivalent?: number;
   elapsedTime?: number;
   remainingTime?: number;
+}
+
+// ─── Distance markers & zones ─────────────────────────────────────────────────
+
+export const DISTANCE_MARKERS = [
+  500, 1000, 2000, 5000, 10000, 21097, 42195,
+] as const;
+
+export interface DistanceZone {
+  zoneIndex: number; // 0–7
+  zoneStart: number;
+  zoneEnd: number; // Infinity for zone 7
+  progressFraction: number; // 0–1 within zone
+  nextMarker: number | null; // null beyond marathon
+}
+
+// Dark background color per zone (used as inline style, not Tailwind class)
+export const ZONE_COLORS: Record<number, string> = {
+  0: "#020617", // slate-950:   0–500m
+  1: "#172554", // blue-950:    500–1000m
+  2: "#083344", // cyan-950:    1000–2000m
+  3: "#042f2e", // teal-950:    2000–5000m
+  4: "#022c22", // emerald-950: 5000–10000m
+  5: "#2e1065", // violet-950:  10000–21097m
+  6: "#3b0764", // purple-950:  21097–42195m
+  7: "#4c0519", // rose-950:    42195m+
+};
+
+// Slightly lighter version for the "already rowed" fill on the left
+export const ZONE_FILL_COLORS: Record<number, string> = {
+  0: "#0f172a", // slate-900
+  1: "#1e3a8a", // blue-900
+  2: "#164e63", // cyan-900
+  3: "#134e4a", // teal-900
+  4: "#064e3b", // emerald-900
+  5: "#4c1d95", // violet-900
+  6: "#581c87", // purple-900
+  7: "#881337", // rose-900
+};
+
+export function computeDistanceZone(totalDistance: number): DistanceZone {
+  const starts = [0, ...DISTANCE_MARKERS];
+  for (let i = 0; i < DISTANCE_MARKERS.length; i++) {
+    const zoneStart = starts[i]!;
+    const zoneEnd = DISTANCE_MARKERS[i]!;
+    if (totalDistance < zoneEnd) {
+      return {
+        zoneIndex: i,
+        zoneStart,
+        zoneEnd,
+        progressFraction: (totalDistance - zoneStart) / (zoneEnd - zoneStart),
+        nextMarker: zoneEnd,
+      };
+    }
+  }
+  // Beyond marathon
+  const lastMarker = DISTANCE_MARKERS[DISTANCE_MARKERS.length - 1]!;
+  return {
+    zoneIndex: 7,
+    zoneStart: lastMarker,
+    zoneEnd: Infinity,
+    progressFraction: 0,
+    nextMarker: null,
+  };
+}
+
+// ─── Split tracking ───────────────────────────────────────────────────────────
+
+export interface Split500m {
+  splitNumber: number; // 1-based (split 1 = 0→500m)
+  durationSeconds: number;
+  strokeCount: number;
+  avgPower: number;
+  avgRate: number;
+}
+
+export interface SplitAccumulator {
+  splitNumber: number;
+  startElapsedTime: number;
+  startStrokeCount: number;
+  powerReadings: number[];
+  rateReadings: number[];
+}
+
+export function freshAccumulator(splitNumber: number): SplitAccumulator {
+  return {
+    splitNumber,
+    startElapsedTime: 0,
+    startStrokeCount: 0,
+    powerReadings: [],
+    rateReadings: [],
+  };
+}
+
+// Called on every metrics tick. Mutates `acc` and returns a completed Split500m
+// when a boundary is crossed, otherwise returns null.
+export function checkSplitBoundary(
+  metrics: RowingMetrics,
+  acc: SplitAccumulator
+): Split500m | null {
+  if (metrics.instantPower !== undefined && metrics.instantPower > 0) {
+    acc.powerReadings.push(metrics.instantPower);
+  }
+  if (metrics.strokeRate !== undefined && metrics.strokeRate > 0) {
+    acc.rateReadings.push(metrics.strokeRate);
+  }
+
+  const dist = metrics.totalDistance ?? 0;
+  const boundary = acc.splitNumber * 500;
+
+  if (dist < boundary) return null;
+
+  const duration = (metrics.elapsedTime ?? 0) - acc.startElapsedTime;
+  const strokes = (metrics.strokeCount ?? 0) - acc.startStrokeCount;
+  const avgPower =
+    acc.powerReadings.length > 0
+      ? Math.round(
+          acc.powerReadings.reduce((a, b) => a + b, 0) /
+            acc.powerReadings.length
+        )
+      : 0;
+  const avgRate =
+    acc.rateReadings.length > 0
+      ? Math.round(
+          (acc.rateReadings.reduce((a, b) => a + b, 0) /
+            acc.rateReadings.length) *
+            10
+        ) / 10
+      : 0;
+
+  return {
+    splitNumber: acc.splitNumber,
+    durationSeconds: Math.max(1, duration),
+    strokeCount: Math.max(0, strokes),
+    avgPower,
+    avgRate,
+  };
 }
 
 // ─── BLE Constants ────────────────────────────────────────────────────────────
@@ -71,7 +210,6 @@ export function parseFTMSRowerData(
   const flags = dataView.getUint16(0, true);
   let offset = 2;
 
-  // Bit 0: More Data (0 = Stroke Rate + Stroke Count present)
   if ((flags & 0x01) === 0) {
     if (offset + 1 <= dataView.byteLength) {
       metrics.strokeRate = dataView.getUint8(offset) / 2;
@@ -83,7 +221,6 @@ export function parseFTMSRowerData(
     }
   }
 
-  // Bit 1: Average Stroke Rate
   if ((flags & 0x02) !== 0) {
     if (offset + 1 <= dataView.byteLength) {
       metrics.avgStrokeRate = dataView.getUint8(offset) / 2;
@@ -91,7 +228,6 @@ export function parseFTMSRowerData(
     }
   }
 
-  // Bit 2: Total Distance (uint24)
   if ((flags & 0x04) !== 0) {
     if (offset + 3 <= dataView.byteLength) {
       metrics.totalDistance =
@@ -102,7 +238,6 @@ export function parseFTMSRowerData(
     }
   }
 
-  // Bit 3: Instantaneous Pace (uint16, s/500m)
   if ((flags & 0x08) !== 0) {
     if (offset + 2 <= dataView.byteLength) {
       metrics.instantPace = dataView.getUint16(offset, true);
@@ -110,7 +245,6 @@ export function parseFTMSRowerData(
     }
   }
 
-  // Bit 4: Average Pace (uint16)
   if ((flags & 0x10) !== 0) {
     if (offset + 2 <= dataView.byteLength) {
       metrics.avgPace = dataView.getUint16(offset, true);
@@ -118,7 +252,6 @@ export function parseFTMSRowerData(
     }
   }
 
-  // Bit 5: Instantaneous Power (int16, W)
   if ((flags & 0x20) !== 0) {
     if (offset + 2 <= dataView.byteLength) {
       metrics.instantPower = dataView.getInt16(offset, true);
@@ -126,7 +259,6 @@ export function parseFTMSRowerData(
     }
   }
 
-  // Bit 6: Average Power (int16)
   if ((flags & 0x40) !== 0) {
     if (offset + 2 <= dataView.byteLength) {
       metrics.avgPower = dataView.getInt16(offset, true);
@@ -134,7 +266,6 @@ export function parseFTMSRowerData(
     }
   }
 
-  // Bit 7: Resistance Level (int16)
   if ((flags & 0x80) !== 0) {
     if (offset + 2 <= dataView.byteLength) {
       metrics.resistanceLevel = dataView.getInt16(offset, true);
@@ -142,7 +273,6 @@ export function parseFTMSRowerData(
     }
   }
 
-  // Bit 8: Expended Energy (uint16 total + uint16/hr + uint8/min)
   if ((flags & 0x100) !== 0) {
     if (offset + 5 <= dataView.byteLength) {
       metrics.totalEnergy = dataView.getUint16(offset, true);
@@ -150,7 +280,6 @@ export function parseFTMSRowerData(
     }
   }
 
-  // Bit 9: Heart Rate (uint8)
   if ((flags & 0x200) !== 0) {
     if (offset + 1 <= dataView.byteLength) {
       metrics.heartRate = dataView.getUint8(offset);
@@ -158,7 +287,6 @@ export function parseFTMSRowerData(
     }
   }
 
-  // Bit 10: Metabolic Equivalent (uint8, /10)
   if ((flags & 0x400) !== 0) {
     if (offset + 1 <= dataView.byteLength) {
       metrics.metabolicEquivalent = dataView.getUint8(offset) / 10;
@@ -166,7 +294,6 @@ export function parseFTMSRowerData(
     }
   }
 
-  // Bit 11: Elapsed Time (uint16, seconds)
   if ((flags & 0x800) !== 0) {
     if (offset + 2 <= dataView.byteLength) {
       metrics.elapsedTime = dataView.getUint16(offset, true);
@@ -174,7 +301,6 @@ export function parseFTMSRowerData(
     }
   }
 
-  // Bit 12: Remaining Time (uint16)
   if ((flags & 0x1000) !== 0) {
     if (offset + 2 <= dataView.byteLength) {
       metrics.remainingTime = dataView.getUint16(offset, true);
